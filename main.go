@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -12,34 +11,51 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-func parseFlags() (path string, debounce time.Duration, cmd []string) {
-	file := flag.String("file", "", "file to watch (required)")
+type arrayFlags []string
+
+func (f *arrayFlags) String() string {
+	return ""
+}
+
+func (f *arrayFlags) Set(value string) error {
+	*f = append(*f, value)
+	return nil
+}
+
+func parseFlags() (paths []string, debounce time.Duration, cmdArgs []string) {
+	var files arrayFlags
 	db := flag.Duration("debounce", 0, "debounce duration")
+	flag.Var(&files, "file", "file to watch (required, repeatable)")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(),
-			"Usage: %s -file <path> [-debounce <dur>] -- <cmd> [args]\n", os.Args[0])
+		log.Printf("Usage: %s -file <path> [-file <path> ...] [-debounce <dur>] -- <cmd> [args]\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 
-	if *file == "" || flag.NArg() == 0 {
+	if len(files) == 0 || flag.NArg() == 0 {
 		flag.Usage()
 		os.Exit(1)
 	}
-	abs, err := filepath.Abs(*file)
-	if err != nil {
-		log.Fatalf("abs path error: %v", err)
+
+	for _, f := range files {
+		abs, err := filepath.Abs(f)
+		if err != nil {
+			log.Fatalf("abs path error: %v", err)
+		}
+		paths = append(paths, abs)
 	}
-	return abs, *db, flag.Args()
+	return paths, *db, flag.Args()
 }
 
-func initWatcher(dir string) *fsnotify.Watcher {
+func initWatcher(dirs map[string]struct{}) *fsnotify.Watcher {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatalf("watcher create error: %v", err)
 	}
-	if err := w.Add(dir); err != nil {
-		log.Fatalf("add watch dir error: %v", err)
+	for d := range dirs {
+		if err := w.Add(d); err != nil {
+			log.Fatalf("add watch dir error: %v", err)
+		}
 	}
 	return w
 }
@@ -52,27 +68,38 @@ func execute(cmdArgs []string) {
 	}
 }
 
-func watch(path string, db time.Duration, cmdArgs []string) {
-	watcher := initWatcher(filepath.Dir(path))
+func watch(paths []string, db time.Duration, cmdArgs []string) {
+	dirs := make(map[string]struct{})
+	watchMap := make(map[string]struct{})
+	for _, p := range paths {
+		dirs[filepath.Dir(p)] = struct{}{}
+		watchMap[p] = struct{}{}
+	}
+
+	watcher := initWatcher(dirs)
 	defer watcher.Close()
 
-	var last time.Time
-	log.Printf("watching %s\n", path)
+	last := make(map[string]time.Time)
+	log.Printf("watching %v\n", paths)
 
 	for {
 		select {
 		case ev, ok := <-watcher.Events:
-			if !ok || filepath.Clean(ev.Name) != path {
+			if !ok {
+				return
+			}
+			p := filepath.Clean(ev.Name)
+			if _, ok := watchMap[p]; !ok {
 				continue
 			}
 			if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) == 0 {
 				continue
 			}
 			now := time.Now()
-			if db > 0 && now.Sub(last) < db {
+			if db > 0 && now.Sub(last[p]) < db {
 				continue
 			}
-			last = now
+			last[p] = now
 			log.Printf("event: %s\n", ev)
 			execute(cmdArgs)
 
@@ -86,6 +113,6 @@ func watch(path string, db time.Duration, cmdArgs []string) {
 }
 
 func main() {
-	path, db, cmdArgs := parseFlags()
-	watch(path, db, cmdArgs)
+	paths, db, cmdArgs := parseFlags()
+	watch(paths, db, cmdArgs)
 }
